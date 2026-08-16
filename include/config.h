@@ -46,7 +46,7 @@
 // ---- Slideshow behaviour -----------------------------------------------------
 #define DEX_MIN               1     // national dex range to draw random ids from
 #define DEX_MAX               1025
-#define DEFAULT_DURATION_SEC  60    // seconds each Pokémon is shown
+#define DEFAULT_DURATION_SEC  5     // seconds each Pokémon is shown
 #define DURATION_MIN_SEC      1
 #define DURATION_MAX_SEC      300
 #define ADJUST_IDLE_MS        2000  // idle after last scroll before saving + resuming
@@ -63,6 +63,7 @@
 #define NAME_MAX_LINES      2
 #define NAME_CHARS_PER_LINE (PANEL_WIDTH / TEXT_CHAR_W)   // 10
 #define LAYOUT_GAP          1   // minimal gap between sprite and name
+#define SPRITE_OFFSET_Y     3   // nudge the sprite down N px (bottom rows clip under name)
 
 // ---- Networking --------------------------------------------------------------
 // Classic front pixel sprite (96x96 RGBA) from the PokéAPI sprites CDN.

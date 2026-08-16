@@ -155,7 +155,7 @@ void displayLoadingStop() {
 
 // ---- State 2: sprite + name -------------------------------------------------
 
-bool displayDrawSprite(const uint8_t* data, size_t len, const char* name) {
+bool displayDrawSprite(const uint8_t* data, size_t len, const char* name, int id) {
     if (!panel) return false;
     if (png.openRAM((uint8_t*)data, (int)len, pngDraw) != PNG_SUCCESS) return false;
 
@@ -174,25 +174,66 @@ bool displayDrawSprite(const uint8_t* data, size_t len, const char* name) {
 
     displayLoadingStop();   // sprite is ready — end State 1 before we draw
 
-    // Layout: name pinned to the bottom, sprite fills everything above it. A
-    // 1-line name leaves a 56px sprite; a 2-line name leaves 48px.
+    // Layout: name pinned to the bottom, sprite fills everything above it.
     const int lines = planLines(name);
     s_nameTopY = PANEL_HEIGHT - nameHeightFor(lines);
     const int spriteAreaH = s_nameTopY - LAYOUT_GAP;
 
+    // Pixel-perfect (1:1) render — every LED shows one source pixel at native
+    // resolution, no scaling. The 96px source is larger than the panel, so we crop
+    // to the window that fits (64 wide, <=56 tall). Rather than cropping the frame
+    // center (sprites aren't consistently positioned in their 96x96 canvas), we
+    // crop around the character's OWN bounding box so it lands centered every time.
+    int minX = g_w, minY = g_h, maxX = -1, maxY = -1;
+    for (int y = 0; y < g_h; y++) {
+        const uint16_t* row = &g_img[y * g_w];
+        for (int x = 0; x < g_w; x++) {
+            if (row[x] != 0) {                    // 0x0000 = transparent->black bg
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    // Center of the actual content (fall back to frame center if it's all black).
+    const int ccx = (maxX >= 0) ? (minX + maxX) / 2 : g_w / 2;
+    const int ccy = (maxY >= 0) ? (minY + maxY) / 2 : g_h / 2;
+
+    const int outW = g_w < PANEL_WIDTH ? g_w : PANEL_WIDTH;
+    const int outH = g_h < spriteAreaH ? g_h : spriteAreaH;
+    // Place the crop window on the content center, clamped to stay inside source.
+    int srcX0 = ccx - outW / 2;
+    int srcY0 = ccy - outH / 2;
+    if (srcX0 < 0) srcX0 = 0;
+    if (srcY0 < 0) srcY0 = 0;
+    if (srcX0 > g_w - outW) srcX0 = g_w - outW;
+    if (srcY0 > g_h - outH) srcY0 = g_h - outH;
+    const int offx = (PANEL_WIDTH - outW) / 2;    // center on the panel
+    const int offy = (spriteAreaH - outH) / 2 + SPRITE_OFFSET_Y;
+
     panel->fillScreen(0);   // fresh frame (clears prior sprite / loading pixels)
 
-    // Nearest-neighbor scale to a centered square (keeps pixel-art crisp).
-    const int size = spriteAreaH < PANEL_WIDTH ? spriteAreaH : PANEL_WIDTH;
-    const int offx = (PANEL_WIDTH - size) / 2;
-    const int offy = (spriteAreaH - size) / 2;   // 0 when height-limited
-    for (int dy = 0; dy < size; dy++) {
-        int sy = dy * g_h / size;
-        for (int dx = 0; dx < size; dx++) {
-            int sx = dx * g_w / size;
+    for (int dy = 0; dy < outH; dy++) {
+        int sy = srcY0 + dy;
+        for (int dx = 0; dx < outW; dx++) {
+            int sx = srcX0 + dx;
             panel->drawPixel(offx + dx, offy + dy, g_img[sy * g_w + sx]);
         }
     }
+
+    // Dex number label, top-right, over a small black backing so it stays legible
+    // against the sprite. Survives name/duration redraws (they clear only the
+    // bottom band), so it's drawn once here per new sprite.
+    char num[8];
+    snprintf(num, sizeof(num), "#%03d", id);
+    int nw = (int)strlen(num) * TEXT_CHAR_W;
+    int nx = PANEL_WIDTH - nw;                 // right-align to the panel edge
+    panel->fillRect(nx - 1, 0, nw + 1, TEXT_GLYPH_H + 1, 0);
+    panel->setTextSize(1);
+    panel->setTextColor(yellow());
+    panel->setCursor(nx, 1);
+    panel->print(num);
 
     free(g_img);
     g_img = nullptr;

@@ -15,9 +15,10 @@ void displayLoadingStop();
 
 // Decode a PNG held in RAM and draw it scaled + centered above the name. The
 // sprite height depends on how many rows `name` needs (1 or 2), so pass the same
-// name you'll hand to displayDrawName(). Clears the sprite region only. Returns
-// false if the PNG can't be decoded.
-bool displayDrawSprite(const uint8_t* png, size_t len, const char* name);
+// name you'll hand to displayDrawName(). `id` is drawn as a "#NNN" label in the
+// top-left corner. Clears the sprite region only. Returns false if the PNG can't
+// be decoded.
+bool displayDrawSprite(const uint8_t* png, size_t len, const char* name, int id);
 
 // Draw `name` in the bottom strip. Centered if it fits, else marquee-scrolled
 // (call every frame to animate). Clears the strip first.
