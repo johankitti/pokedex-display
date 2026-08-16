@@ -19,26 +19,54 @@ static bool nameScrolls = false;
 static uint32_t slideStartMs = 0;
 static uint32_t lastAdjustMs = 0;
 
+// Prefetched next slide: its sprite bytes are fetched over the network while the
+// current slide is still on screen, so the swap only costs a decode+draw and the
+// slide timing tracks the duration clock instead of duration + fetch time.
+static uint8_t* pendBuf   = nullptr;
+static size_t   pendLen   = 0;
+static char     pendName[24] = "";
+static int      pendId    = -1;
+static bool     pendReady = false;
+
 static int clampDuration(int s) {
     if (s < DURATION_MIN_SEC) s = DURATION_MIN_SEC;
     if (s > DURATION_MAX_SEC) s = DURATION_MAX_SEC;
     return s;
 }
 
-// Fetch + draw the next random Pokémon. Keeps the previous image on screen while
-// loading (drawSprite clears the sprite region only on success).
-static void nextPokemon() {
-    int id = pokemonNext(curName, sizeof(curName));
-    if (id < 0) {
-        displayStatus("no net");
-        curId = -1;
-        slideStartMs = millis();
-        return;
+// Blocking fetch of the next random sprite into the pending slot. Called while the
+// current sprite is displayed, so its network latency hides inside the slide.
+static void prefetchNext() {
+    if (pendReady) return;
+    uint8_t* buf = nullptr; size_t len = 0; int id = -1; char nm[24];
+    if (pokemonPrefetch(nm, sizeof(nm), &id, &buf, &len)) {
+        pendBuf = buf; pendLen = len; pendId = id;
+        strncpy(pendName, nm, sizeof(pendName) - 1);
+        pendName[sizeof(pendName) - 1] = 0;
+        pendReady = true;
     }
-    curId = id;
-    nameScrolls = displayNameScrolls(curName);
-    displayDrawName(curName);
+}
+
+// Swap to the prefetched slide (cheap decode+draw), then immediately start
+// fetching the following one so it's ready before this slide's duration elapses.
+static void advanceSlide() {
+    if (!pendReady) prefetchNext();          // slow net / button-mash: fetch now
+    bool ok = pendReady && displayDrawSprite(pendBuf, pendLen, pendName, pendId);
+    if (pendBuf) { netFree(pendBuf); pendBuf = nullptr; }
+    pendReady = false;
+
+    if (ok) {
+        curId = pendId;
+        strncpy(curName, pendName, sizeof(curName) - 1);
+        curName[sizeof(curName) - 1] = 0;
+        nameScrolls = displayNameScrolls(curName);
+        displayDrawName(curName);
+    } else {
+        displayStatus("no net");             // fetch/decode failed — retry via loop
+        curId = -1;
+    }
     slideStartMs = millis();
+    prefetchNext();                          // fetch the next one during this slide
 }
 
 void setup() {
@@ -77,7 +105,7 @@ void setup() {
         ESP.restart();
     }
 
-    nextPokemon();
+    advanceSlide();   // fetch (loading anim covers it) + show first, prefetch second
 }
 
 void loop() {
@@ -106,11 +134,11 @@ void loop() {
 
     // SLIDESHOW
     if (btn) {
-        nextPokemon();
+        advanceSlide();
     } else if (curId < 0) {
-        if (millis() - slideStartMs >= 5000) nextPokemon();   // retry after a dropout
+        if (millis() - slideStartMs >= 5000) advanceSlide();   // retry after a dropout
     } else if (millis() - slideStartMs >= (uint32_t)durationSec * 1000UL) {
-        nextPokemon();
+        advanceSlide();
     } else if (nameScrolls) {
         displayDrawName(curName);   // animate marquee for long names
     }
