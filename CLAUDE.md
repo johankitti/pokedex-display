@@ -82,7 +82,9 @@ never both). Keep brightness ~20 while testing on USB; ~90 once on the supply.
 - `ANIM_MIN_FRAME_MS` — floor on GIF per-frame delay.
 - `HOSTNAME` — mDNS name for the settings UI.
 - `PANEL_BRIGHTNESS` (default for a fresh device), `BRIGHTNESS_MIN`/`MAX`/`STEP`,
-  `ENC_COUNTS_PER_DETENT` — brightness + encoder tuning.
+  `ENC_COUNTS_PER_DETENT` — brightness + encoder tuning. `BRIGHTNESS_MAX` is capped
+  (140, not 255) to keep panel current under a 5V/3A supply; raise it only with a
+  bigger supply.
 - `NAME_BOTTOM_PAD`, sprite layout constants.
 
 If colors look swapped or the image is shifted, flip the `gif.begin()` palette

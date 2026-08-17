@@ -15,7 +15,12 @@
 // rotary encoder / web slider (see settings.*).
 #define PANEL_BRIGHTNESS 20
 #define BRIGHTNESS_MIN          2     // never fully off (0 looks like a dead panel)
-#define BRIGHTNESS_MAX          255
+// Capped (not 255) to bound current draw to the 5V/3A supply: brightness is ~linear
+// with panel current, whose full-white max is ~4A (20W) at 255. 140/255 keeps even
+// an all-white frame near ~2.2A panel + ~0.5A ESP = ~2.7A, under 3A with margin.
+// Real sprites (black background) draw far less. Raise only with a bigger supply
+// (or after measuring actual draw at max brightness on a bright test image).
+#define BRIGHTNESS_MAX          140
 #define BRIGHTNESS_STEP         8     // brightness change per encoder detent
 #define BRIGHTNESS_SAVE_IDLE_MS 1500  // persist to NVS this long after the last turn
 
