@@ -2,31 +2,90 @@
 #include "config.h"
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <AnimatedGIF.h>
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
 
 static MatrixPanel_I2S_DMA* panel = nullptr;
+static AnimatedGIF gif;
 static PNG png;
 
-// Full-resolution decode target (RGB565, already composited over black),
-// allocated per sprite and freed once scaled onto the panel.
-static uint16_t* g_img = nullptr;
-static int g_w = 0, g_h = 0;
+// Persistent RGB565 canvas for the currently-playing GIF (allocated in PSRAM at
+// displayAnimStart, freed at displayAnimStop). GIF frames are often partial and
+// composite onto the prior frame, so the full canvas must survive across frames.
+static uint16_t* g_canvas = nullptr;
+static int g_cw = 0, g_ch = 0;
+
+// Frozen crop window + panel placement for the current slide. Computed once from
+// the first frame so limb movement between frames doesn't make the sprite jitter.
+static int s_srcX0 = 0, s_srcY0 = 0, s_outW = 0, s_outH = 0, s_offx = 0, s_offy = 0;
+
+// Bounding box of the top-right dex label. The per-frame blit skips this rect so
+// the animated sprite never bleeds through behind the number: it stays black (from
+// the slide's initial fillScreen) and the label is painted on top just once.
+static int s_numLeft = PANEL_WIDTH, s_numBottom = 0;
+
+// Animation playback state: whether a GIF is open and when the next frame is due.
+static bool     s_animOpen = false;
+static uint32_t s_nextFrameMs = 0;
+static uint16_t s_speedPct = ANIM_SPEED_DEFAULT;   // 100 = authored/original timing
+
+// Disposal of the frame currently on the canvas — captured during its draw and
+// applied BEFORE the next frame. Method 2 ("restore to background") means the
+// frame's rect must be cleared to black before compositing the next one, else
+// moving sprites smear their previous frame across the canvas.
+static int     s_dispX = 0, s_dispY = 0, s_dispW = 0, s_dispH = 0;
+static uint8_t s_dispMethod = 0;
+
+// Dex label ("#NNN") for the current sprite. Redrawn after every frame because the
+// sprite region is repainted each frame and would otherwise erase it.
+static char s_dexLabel[8] = "";
 
 // Top row of the current name band (1 or 2 lines), pinned to the bottom of the
 // panel. Set whenever the sprite or name is drawn; the seconds overlay uses it to
 // clear exactly the name band and never the sprite above it.
-static int s_nameTopY = PANEL_HEIGHT - TEXT_GLYPH_H;
+static int s_nameTopY = PANEL_HEIGHT - TEXT_GLYPH_H - NAME_BOTTOM_PAD;
 
 static uint16_t white()  { return MatrixPanel_I2S_DMA::color565(255, 255, 255); }
 static uint16_t yellow() { return MatrixPanel_I2S_DMA::color565(255, 210, 0); }
 static uint16_t blue()   { return MatrixPanel_I2S_DMA::color565(110, 170, 255); }
 
-// PNGdec callback: composite one decoded line over black into g_img.
-static int pngDraw(PNGDRAW* pDraw) {
-    if (!g_img) return 0;
-    uint16_t* dst = &g_img[pDraw->y * g_w];
-    png.getLineAsRGB565(pDraw, dst, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
+// AnimatedGIF callback: composite one line of the current frame onto g_canvas.
+// Transparent pixels are skipped so the previous frame shows through (correct for
+// leave-in-place disposal, which the Gen-V sprites use). Palette is RGB565-LE to
+// match the panel's native color565() packing (flip GIF_PALETTE below if swapped).
+static void gifDraw(GIFDRAW* d) {
+    if (!g_canvas) return;
+    if (d->y == 0) {                     // first line of a frame: record its extent
+        s_dispX = d->iX; s_dispY = d->iY;
+        s_dispW = d->iWidth; s_dispH = d->iHeight;
+        s_dispMethod = d->ucDisposalMethod;
+    }
+    int yy = d->iY + d->y;
+    if (yy < 0 || yy >= g_ch) return;
+    int w = d->iWidth;
+    if (d->iX + w > g_cw) w = g_cw - d->iX;   // clip to canvas width
+    if (w <= 0) return;
+    uint16_t* dst = &g_canvas[yy * g_cw + d->iX];
+    const uint8_t* src = d->pPixels;
+    const uint16_t* pal = d->pPalette;
+    if (d->ucHasTransparency) {
+        const uint8_t tr = d->ucTransparent;
+        for (int x = 0; x < w; x++) {
+            uint8_t p = src[x];
+            if (p != tr) dst[x] = pal[p];
+        }
+    } else {
+        for (int x = 0; x < w; x++) dst[x] = pal[src[x]];
+    }
+}
+
+// PNGdec callback: composite one decoded line over black into g_canvas. Uses the
+// same RGB565-LE packing as the GIF path so both share the crop/blit pipeline.
+static int pngDraw(PNGDRAW* p) {
+    if (!g_canvas) return 0;
+    uint16_t* dst = &g_canvas[p->y * g_cw];
+    png.getLineAsRGB565(p, dst, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
     return 1;
 }
 
@@ -42,6 +101,11 @@ void displayInit() {
     panel->setBrightness8(PANEL_BRIGHTNESS);
     panel->clearScreen();
     panel->setTextWrap(false);
+
+    // Emit palette entries as little-endian RGB565 so pPalette[i] read as a uint16_t
+    // on this (LE) MCU equals what panel->drawPixel expects. Switch to
+    // GIF_PALETTE_RGB565_BE if colors come out swapped.
+    gif.begin(GIF_PALETTE_RGB565_LE);
 }
 
 void displayClear() {
@@ -153,41 +217,52 @@ void displayLoadingStop() {
     while (s_loadingTask) vTaskDelay(pdMS_TO_TICKS(5));   // wait for it to exit
 }
 
-// ---- State 2: sprite + name -------------------------------------------------
+// ---- State 2: animated sprite + name ----------------------------------------
 
-bool displayDrawSprite(const uint8_t* data, size_t len, const char* name, int id) {
-    if (!panel) return false;
-    if (png.openRAM((uint8_t*)data, (int)len, pngDraw) != PNG_SUCCESS) return false;
+// Dex number label, top-right, over a small black backing so it stays legible
+// against the sprite. The sprite region is repainted every frame, so this is
+// redrawn after each blit (not just once per slide like the still-PNG version).
+static void drawDexLabel() {
+    if (!panel || !s_dexLabel[0]) return;
+    int nw = (int)strlen(s_dexLabel) * TEXT_CHAR_W;
+    int nx = PANEL_WIDTH - nw;                 // right-align to the panel edge
+    panel->fillRect(nx - 1, 0, nw + 1, TEXT_GLYPH_H + 1, 0);
+    panel->setTextSize(1);
+    panel->setTextColor(yellow());
+    panel->setCursor(nx, 1);
+    panel->print(s_dexLabel);
+}
 
-    g_w = png.getWidth();
-    g_h = png.getHeight();
-    if (g_w <= 0 || g_h <= 0) { png.close(); return false; }
+// Blit the frozen crop window of g_canvas onto the panel (1:1, no scaling). Pixels
+// inside the dex-label box are skipped so they stay black and the number (drawn
+// once by drawDexLabel) never has the sprite flickering through behind it.
+static void blitCanvas() {
+    if (!panel || !g_canvas) return;
+    for (int dy = 0; dy < s_outH; dy++) {
+        int sy = s_srcY0 + dy;
+        int py = s_offy + dy;
+        const uint16_t* row = &g_canvas[sy * g_cw + s_srcX0];
+        bool inLabelRow = (py < s_numBottom);
+        for (int dx = 0; dx < s_outW; dx++) {
+            int px = s_offx + dx;
+            if (inLabelRow && px >= s_numLeft) continue;   // leave the label box black
+            panel->drawPixel(px, py, row[dx]);
+        }
+    }
+}
 
-    size_t bytes = (size_t)g_w * g_h * sizeof(uint16_t);
-    g_img = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-    if (!g_img) g_img = (uint16_t*)malloc(bytes);
-    if (!g_img) { png.close(); return false; }
-
-    int rc = png.decode(nullptr, 0);
-    png.close();
-    if (rc != PNG_SUCCESS) { free(g_img); g_img = nullptr; return false; }
-
-    displayLoadingStop();   // sprite is ready — end State 1 before we draw
-
-    // Layout: name pinned to the bottom, sprite fills everything above it.
+// Compute the frozen crop window from the content bounding box of the frame
+// currently in g_canvas (see the still-PNG rationale: crop around the character's
+// own bounds so it lands centered). Called once per slide from the first frame.
+static void computeCrop(const char* name) {
     const int lines = planLines(name);
-    s_nameTopY = PANEL_HEIGHT - nameHeightFor(lines);
+    s_nameTopY = PANEL_HEIGHT - nameHeightFor(lines) - NAME_BOTTOM_PAD;
     const int spriteAreaH = s_nameTopY - LAYOUT_GAP;
 
-    // Pixel-perfect (1:1) render — every LED shows one source pixel at native
-    // resolution, no scaling. The 96px source is larger than the panel, so we crop
-    // to the window that fits (64 wide, <=56 tall). Rather than cropping the frame
-    // center (sprites aren't consistently positioned in their 96x96 canvas), we
-    // crop around the character's OWN bounding box so it lands centered every time.
-    int minX = g_w, minY = g_h, maxX = -1, maxY = -1;
-    for (int y = 0; y < g_h; y++) {
-        const uint16_t* row = &g_img[y * g_w];
-        for (int x = 0; x < g_w; x++) {
+    int minX = g_cw, minY = g_ch, maxX = -1, maxY = -1;
+    for (int y = 0; y < g_ch; y++) {
+        const uint16_t* row = &g_canvas[y * g_cw];
+        for (int x = 0; x < g_cw; x++) {
             if (row[x] != 0) {                    // 0x0000 = transparent->black bg
                 if (x < minX) minX = x;
                 if (x > maxX) maxX = x;
@@ -196,61 +271,169 @@ bool displayDrawSprite(const uint8_t* data, size_t len, const char* name, int id
             }
         }
     }
-    // Center of the actual content (fall back to frame center if it's all black).
-    const int ccx = (maxX >= 0) ? (minX + maxX) / 2 : g_w / 2;
-    const int ccy = (maxY >= 0) ? (minY + maxY) / 2 : g_h / 2;
+    const int ccx = (maxX >= 0) ? (minX + maxX) / 2 : g_cw / 2;
+    const int ccy = (maxY >= 0) ? (minY + maxY) / 2 : g_ch / 2;
 
-    const int outW = g_w < PANEL_WIDTH ? g_w : PANEL_WIDTH;
-    const int outH = g_h < spriteAreaH ? g_h : spriteAreaH;
-    // Place the crop window on the content center, clamped to stay inside source.
-    int srcX0 = ccx - outW / 2;
-    int srcY0 = ccy - outH / 2;
-    if (srcX0 < 0) srcX0 = 0;
-    if (srcY0 < 0) srcY0 = 0;
-    if (srcX0 > g_w - outW) srcX0 = g_w - outW;
-    if (srcY0 > g_h - outH) srcY0 = g_h - outH;
-    const int offx = (PANEL_WIDTH - outW) / 2;    // center on the panel
-    const int offy = (spriteAreaH - outH) / 2 + SPRITE_OFFSET_Y;
+    s_outW = g_cw < PANEL_WIDTH ? g_cw : PANEL_WIDTH;
+    s_outH = g_ch < spriteAreaH ? g_ch : spriteAreaH;
+    s_srcX0 = ccx - s_outW / 2;
+    s_srcY0 = ccy - s_outH / 2;
+    if (s_srcX0 < 0) s_srcX0 = 0;
+    if (s_srcY0 < 0) s_srcY0 = 0;
+    if (s_srcX0 > g_cw - s_outW) s_srcX0 = g_cw - s_outW;
+    if (s_srcY0 > g_ch - s_outH) s_srcY0 = g_ch - s_outH;
+    s_offx = (PANEL_WIDTH - s_outW) / 2;          // center on the panel
+    s_offy = (spriteAreaH - s_outH) / 2 + SPRITE_OFFSET_Y;
+    // Keep the blit strictly above the name band (SPRITE_OFFSET_Y can nudge the
+    // bottom rows into it; the still version relied on the name drawing last).
+    if (s_offy + s_outH > s_nameTopY) s_outH = s_nameTopY - s_offy;
+
+    // Dex-label box the blit must leave black (matches drawDexLabel's fillRect).
+    int nw = (int)strlen(s_dexLabel) * TEXT_CHAR_W;
+    s_numLeft = nw ? (PANEL_WIDTH - nw - 1) : PANEL_WIDTH;
+    s_numBottom = nw ? (TEXT_GLYPH_H + 1) : 0;
+}
+
+// Clear the previous frame's rect to black if it asked to be disposed to the
+// background. Called before compositing the next frame onto the canvas.
+static void applyDisposal() {
+    if (s_dispMethod != 2 || !g_canvas) return;   // 2 = restore to background
+    for (int y = 0; y < s_dispH; y++) {
+        int yy = s_dispY + y;
+        if (yy < 0 || yy >= g_ch) continue;
+        int w = s_dispW;
+        if (s_dispX + w > g_cw) w = g_cw - s_dispX;
+        if (w <= 0) continue;
+        uint16_t* row = &g_canvas[yy * g_cw + s_dispX];
+        for (int x = 0; x < w; x++) row[x] = 0;
+    }
+}
+
+void displayAnimStop() {
+    if (s_animOpen) { gif.close(); s_animOpen = false; }
+    if (g_canvas) { free(g_canvas); g_canvas = nullptr; }
+    g_cw = g_ch = 0;
+    s_dexLabel[0] = 0;
+    s_dispMethod = 0;
+}
+
+bool displayAnimStart(const uint8_t* data, size_t len, const char* name, int id) {
+    if (!panel) return false;
+    displayAnimStop();   // drop any previous slide's GIF + canvas
+
+    if (!gif.open((uint8_t*)data, (int)len, gifDraw)) return false;
+    g_cw = gif.getCanvasWidth();
+    g_ch = gif.getCanvasHeight();
+    if (g_cw <= 0 || g_ch <= 0) { gif.close(); return false; }
+
+    size_t bytes = (size_t)g_cw * g_ch * sizeof(uint16_t);
+    g_canvas = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!g_canvas) g_canvas = (uint16_t*)malloc(bytes);
+    if (!g_canvas) { gif.close(); return false; }
+    memset(g_canvas, 0, bytes);   // black background (transparent pixels rest here)
+    s_animOpen = true;
+
+    // Decode the first frame so we can size the crop from real content. The decoder
+    // is left positioned at frame 1, so the first tick continues smoothly (no
+    // double-showing frame 0). A single-frame GIF ends here — rewind so ticks loop it.
+    int delayMs = 0;
+    int rc0 = gif.playFrame(false, &delayMs);
+    if (rc0 < 0) { displayAnimStop(); return false; }
+    if (rc0 == 0) gif.reset();
+
+    displayLoadingStop();   // first frame is ready — end State 1 before we draw
+
+    snprintf(s_dexLabel, sizeof(s_dexLabel), "#%03d", id);
+    computeCrop(name);
 
     panel->fillScreen(0);   // fresh frame (clears prior sprite / loading pixels)
+    blitCanvas();
+    drawDexLabel();         // once — the blit leaves its box black, so it persists
 
-    for (int dy = 0; dy < outH; dy++) {
-        int sy = srcY0 + dy;
-        for (int dx = 0; dx < outW; dx++) {
-            int sx = srcX0 + dx;
-            panel->drawPixel(offx + dx, offy + dy, g_img[sy * g_w + sx]);
-        }
+    // Start motion instantly: advance to frame 1 on the very next tick rather than
+    // holding frame 0 for its encoded delay. Some sprites open on a long "rest"
+    // frame, which looked like the animation was frozen for a moment at slide start.
+    (void)delayMs;
+    s_nextFrameMs = millis();
+    return true;
+}
+
+bool displayShowStatic(const uint8_t* data, size_t len, const char* name, int id) {
+    if (!panel) return false;
+    displayAnimStop();   // drop any previous slide's GIF + canvas
+
+    if (png.openRAM((uint8_t*)data, (int)len, pngDraw) != PNG_SUCCESS) return false;
+    g_cw = png.getWidth();
+    g_ch = png.getHeight();
+    if (g_cw <= 0 || g_ch <= 0) { png.close(); return false; }
+
+    size_t bytes = (size_t)g_cw * g_ch * sizeof(uint16_t);
+    g_canvas = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!g_canvas) g_canvas = (uint16_t*)malloc(bytes);
+    if (!g_canvas) { png.close(); return false; }
+    memset(g_canvas, 0, bytes);   // black background (transparent -> black)
+
+    int rc = png.decode(nullptr, 0);
+    png.close();
+    if (rc != PNG_SUCCESS) { free(g_canvas); g_canvas = nullptr; return false; }
+
+    displayLoadingStop();   // sprite is ready — end State 1 before we draw
+
+    snprintf(s_dexLabel, sizeof(s_dexLabel), "#%03d", id);
+    computeCrop(name);
+
+    panel->fillScreen(0);
+    blitCanvas();
+    drawDexLabel();
+    s_animOpen = false;     // static: displayAnimTick() is a no-op for this slide
+    return true;
+}
+
+void displayAnimTick() {
+    if (!s_animOpen || !panel) return;
+    uint32_t now = millis();
+    if ((int32_t)(now - s_nextFrameMs) < 0) return;   // next frame not due yet
+
+    applyDisposal();                                  // clear prior frame if needed
+    int delayMs = 0;
+    int rc = gif.playFrame(false, &delayMs);          // composites onto g_canvas
+    if (rc < 0) { s_animOpen = false; return; }        // decode error: freeze frame
+    blitCanvas();
+    if (rc == 0) {                                     // last frame: restart the loop
+        gif.reset();
+        memset(g_canvas, 0, (size_t)g_cw * g_ch * sizeof(uint16_t));
+        s_dispMethod = 0;                              // fresh canvas, no prior frame
     }
 
-    // Dex number label, top-right, over a small black backing so it stays legible
-    // against the sprite. Survives name/duration redraws (they clear only the
-    // bottom band), so it's drawn once here per new sprite.
-    char num[8];
-    snprintf(num, sizeof(num), "#%03d", id);
-    int nw = (int)strlen(num) * TEXT_CHAR_W;
-    int nx = PANEL_WIDTH - nw;                 // right-align to the panel edge
-    panel->fillRect(nx - 1, 0, nw + 1, TEXT_GLYPH_H + 1, 0);
-    panel->setTextSize(1);
-    panel->setTextColor(yellow());
-    panel->setCursor(nx, 1);
-    panel->print(num);
+    // Scale the authored delay by the speed setting (100 = original), then floor.
+    if (s_speedPct != 100 && s_speedPct > 0)
+        delayMs = (int)((long)delayMs * 100 / s_speedPct);
+    if (delayMs < ANIM_MIN_FRAME_MS) delayMs = ANIM_MIN_FRAME_MS;
 
-    free(g_img);
-    g_img = nullptr;
-    return true;
+    // Advance the schedule from the previous target, not from `now`, so loop latency
+    // doesn't accumulate and playback holds the GIF's authored cadence. Resync if we
+    // fell more than a frame behind (e.g. after a stall) to avoid a catch-up burst.
+    s_nextFrameMs += delayMs;
+    if ((int32_t)(now - s_nextFrameMs) > delayMs) s_nextFrameMs = now + delayMs;
+}
+
+void displaySetSpeed(uint16_t pct) {
+    if (pct < ANIM_SPEED_MIN) pct = ANIM_SPEED_MIN;
+    if (pct > ANIM_SPEED_MAX) pct = ANIM_SPEED_MAX;
+    s_speedPct = pct;
 }
 
 void displayDrawName(const char* name) {
     if (!panel) return;
     const int lines = planLines(name);
-    s_nameTopY = PANEL_HEIGHT - nameHeightFor(lines);
+    s_nameTopY = PANEL_HEIGHT - nameHeightFor(lines) - NAME_BOTTOM_PAD;
     panel->fillRect(0, s_nameTopY, PANEL_WIDTH, PANEL_HEIGHT - s_nameTopY, 0);
     panel->setTextSize(1);
     panel->setTextColor(white());
 
     // Too long for two lines: single-line marquee on the bottom row.
     if (displayNameScrolls(name)) {
-        const int y = PANEL_HEIGHT - TEXT_GLYPH_H;
+        const int y = PANEL_HEIGHT - TEXT_GLYPH_H - NAME_BOTTOM_PAD;
         const int w = (int)strlen(name) * TEXT_CHAR_W;
         const int total = w + 12;
         const int off = (int)((millis() / 40) % total);   // ~25 px/s
@@ -261,7 +444,7 @@ void displayDrawName(const char* name) {
 
     char l1[24], l2[24];
     if (wrapName(name, l1, l2, sizeof(l1)) == 1) {
-        drawCentered(l1, PANEL_HEIGHT - TEXT_GLYPH_H);     // single bottom line
+        drawCentered(l1, PANEL_HEIGHT - TEXT_GLYPH_H - NAME_BOTTOM_PAD);   // single bottom line
     } else {
         drawCentered(l1, s_nameTopY);                      // top line
         drawCentered(l2, s_nameTopY + TEXT_LINE_H);        // bottom line
@@ -278,7 +461,7 @@ void displayDrawDuration(int seconds) {
     snprintf(buf, sizeof(buf), "%ds", seconds);
     panel->setTextSize(1);
     panel->setTextColor(yellow());
-    drawCentered(buf, PANEL_HEIGHT - TEXT_GLYPH_H);        // bottom-most row
+    drawCentered(buf, PANEL_HEIGHT - TEXT_GLYPH_H - NAME_BOTTOM_PAD);   // bottom-most row
 }
 
 void displaySetup(const char* ssid, const char* ip) {

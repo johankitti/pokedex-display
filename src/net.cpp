@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <WiFiManager.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h>
 
 static uint8_t* allocBuf(size_t n) {
     uint8_t* p = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
@@ -18,30 +19,64 @@ void netFree(uint8_t* buf) {
     if (buf) free(buf);   // free() routes to the right heap on ESP32
 }
 
-bool netStart(bool forcePortal) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
+// Are Wi-Fi credentials stored in NVS? (esp_wifi is up once WiFi.mode() ran.)
+static bool hasSavedCreds() {
+    wifi_config_t conf;
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return false;
+    return conf.sta.ssid[0] != 0;
+}
 
+// Patiently try the SAVED network for up to timeoutMs, showing a connecting screen.
+// The driver keeps retrying in the background, so a router that comes up partway
+// through the window still gets picked up. Returns true if connected.
+static bool connectSaved(uint32_t timeoutMs) {
+    displayStatus("connecting\nto Wi-Fi...");
+    Serial.printf("[net] connecting to saved network (up to %us)\n", timeoutMs / 1000);
+    WiFi.begin();   // no args -> use credentials stored in NVS
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        if (WiFi.status() == WL_CONNECTED) return true;
+        delay(250);
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// Open the setup portal (with a timeout) so a new/changed network can be provisioned.
+// Returns true if the user configured a network and we connected.
+static bool runPortal() {
     WiFiManager wm;
-    wm.setConfigPortalTimeout(0);     // keep the portal open until configured
-    // State 0: the moment the setup AP opens, show join instructions + the portal
-    // address on the panel. Fires only when the portal actually opens, so a normal
-    // boot with saved creds connects instantly and never shows this.
+    wm.setConfigPortalTimeout(NET_PORTAL_TIMEOUT_SEC);   // times out, then we retry saved
     wm.setAPCallback([](WiFiManager*) {
         String ip = WiFi.softAPIP().toString();
         displaySetup(AP_SETUP_SSID, ip.c_str());
-        Serial.printf("[net] setup AP '%s' open at http://%s\n",
-                      AP_SETUP_SSID, ip.c_str());
+        Serial.printf("[net] setup AP '%s' open at http://%s\n", AP_SETUP_SSID, ip.c_str());
     });
+    bool ok = wm.startConfigPortal(AP_SETUP_SSID);
+    return ok && WiFi.status() == WL_CONNECTED;
+}
 
-    bool ok = forcePortal ? wm.startConfigPortal(AP_SETUP_SSID)
-                          : wm.autoConnect(AP_SETUP_SSID);
+bool netStart() {
+    WiFi.persistent(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
 
-    if (ok && WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[net] IP %s\n", WiFi.localIP().toString().c_str());
-        return true;
+    // Cycle until connected: retry the saved network patiently, then offer the portal
+    // (with a timeout), then retry the saved network again. A transient outage resolves
+    // in the connect phase; a genuinely changed network is fixed at the portal —
+    // neither phase is a dead end.
+    for (;;) {
+        if (hasSavedCreds() && connectSaved(NET_CONNECT_TIMEOUT_MS)) {
+            Serial.printf("[net] IP %s\n", WiFi.localIP().toString().c_str());
+            return true;
+        }
+        Serial.println("[net] not connected — opening setup portal");
+        if (runPortal()) {
+            Serial.printf("[net] IP %s\n", WiFi.localIP().toString().c_str());
+            return true;
+        }
+        Serial.println("[net] portal timed out — retrying saved network");
     }
-    return false;
 }
 
 bool netEnsure() {

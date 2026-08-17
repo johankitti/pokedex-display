@@ -10,11 +10,11 @@ static uint32_t lastBtnMs = 0;
 
 void inputInit() {
     ESP32Encoder::useInternalWeakPullResistors = puType::up;
-    enc.attachFullQuad(PIN_ENC_A, PIN_ENC_B);
+    enc.attachFullQuad(PIN_ENC_A, PIN_ENC_B);   // GPIO44 (A) + GPIO14 (B)
     enc.clearCount();
     lastCount = 0;
 
-    pinMode(PIN_ENC_SW, INPUT_PULLUP);
+    pinMode(PIN_ENC_SW, INPUT_PULLUP);          // GPIO0 (BOOT)
     lastBtn = digitalRead(PIN_ENC_SW);
 }
 

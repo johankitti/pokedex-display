@@ -13,12 +13,29 @@ void displayClear();
 void displayLoadingStart();
 void displayLoadingStop();
 
-// Decode a PNG held in RAM and draw it scaled + centered above the name. The
+// Begin animating a GIF held in RAM: opens it, draws the first frame + the "#NNN"
+// dex label (top-right), and freezes a crop window centered on the sprite. The
 // sprite height depends on how many rows `name` needs (1 or 2), so pass the same
-// name you'll hand to displayDrawName(). `id` is drawn as a "#NNN" label in the
-// top-left corner. Clears the sprite region only. Returns false if the PNG can't
-// be decoded.
-bool displayDrawSprite(const uint8_t* png, size_t len, const char* name, int id);
+// name you'll hand to displayDrawName(). The caller must keep `gif`/`len` valid
+// until displayAnimStop() — the decoder reads the buffer on every frame. Returns
+// false if the GIF can't be opened.
+bool displayAnimStart(const uint8_t* gif, size_t len, const char* name, int id);
+
+// Render the next GIF frame if its delay has elapsed (call every loop iteration);
+// loops back to the first frame at the end so motion continues for the whole
+// slide. Cheap no-op until the next frame is due. Redraws only the sprite region
+// and the dex label, never the name band.
+void displayAnimTick();
+
+// Stop animation, close the GIF, and free the frame canvas. Idempotent. Call
+// before freeing the GIF buffer handed to displayAnimStart().
+void displayAnimStop();
+
+// Decode a still PNG and draw it centered above the name (same crop/label/name
+// pipeline as the animated path, but a single frame — displayAnimTick() is a
+// no-op afterward). The PNG is decoded into the canvas, so the caller may free
+// `png` as soon as this returns. Returns false if the PNG can't be decoded.
+bool displayShowStatic(const uint8_t* png, size_t len, const char* name, int id);
 
 // Draw `name` in the bottom strip. Centered if it fits, else marquee-scrolled
 // (call every frame to animate). Clears the strip first.
@@ -38,3 +55,6 @@ void displaySetup(const char* ssid, const char* ip);
 void displayStatus(const char* msg);
 
 void displaySetBrightness(uint8_t b);
+
+// Set GIF playback speed as a percentage of authored timing (100 = original).
+void displaySetSpeed(uint16_t pct);

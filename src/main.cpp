@@ -1,59 +1,88 @@
 #include <Arduino.h>
-#include <Preferences.h>
 
 #include "config.h"
 #include "display.h"
+#include "input.h"
 #include "net.h"
 #include "pokemon.h"
-#include "input.h"
-
-static Preferences prefs;
-static int durationSec = DEFAULT_DURATION_SEC;
-
-enum Mode { SLIDESHOW, ADJUSTING };
-static Mode mode = SLIDESHOW;
+#include "settings.h"
+#include "web.h"
 
 static char curName[24] = "";
 static int  curId = -1;
 static bool nameScrolls = false;
 static uint32_t slideStartMs = 0;
-static uint32_t lastAdjustMs = 0;
 
 // Prefetched next slide: its sprite bytes are fetched over the network while the
-// current slide is still on screen, so the swap only costs a decode+draw and the
-// slide timing tracks the duration clock instead of duration + fetch time.
-static uint8_t* pendBuf   = nullptr;
-static size_t   pendLen   = 0;
-static char     pendName[24] = "";
-static int      pendId    = -1;
-static bool     pendReady = false;
+// current slide is still on screen, so the swap only costs decoding + the slide
+// timing tracks the duration clock instead of duration + fetch time.
+// The fetch runs on a background task (core 0) so the network latency never blocks
+// the animation ticking on the main loop (core 1). pendReady is the handshake flag:
+// the task writes the buffer/metadata then sets it last; the main loop consumes it
+// only while true and clears it before requesting the next fetch.
+static uint8_t*   pendBuf   = nullptr;
+static size_t     pendLen   = 0;
+static char       pendName[24] = "";
+static int        pendId    = -1;
+static SpriteType pendType  = SPRITE_PNG;
+static volatile bool pendReady = false;
+static volatile bool fetchBusy = false;   // task is mid-fetch
+static TaskHandle_t  fetchTask = nullptr;
 
-static int clampDuration(int s) {
-    if (s < DURATION_MIN_SEC) s = DURATION_MIN_SEC;
-    if (s > DURATION_MAX_SEC) s = DURATION_MAX_SEC;
-    return s;
-}
+// Raw sprite bytes of the slide currently on screen. For GIFs the animation decoder
+// re-reads this on every frame, so it must live until the next advanceSlide(). (PNG
+// slides decode into the canvas up front, so their bytes are freed immediately.)
+static uint8_t* curGifBuf = nullptr;
 
-// Blocking fetch of the next random sprite into the pending slot. Called while the
-// current sprite is displayed, so its network latency hides inside the slide.
-static void prefetchNext() {
-    if (pendReady) return;
-    uint8_t* buf = nullptr; size_t len = 0; int id = -1; char nm[24];
-    if (pokemonPrefetch(nm, sizeof(nm), &id, &buf, &len)) {
-        pendBuf = buf; pendLen = len; pendId = id;
-        strncpy(pendName, nm, sizeof(pendName) - 1);
-        pendName[sizeof(pendName) - 1] = 0;
-        pendReady = true;
+// Core-0 worker: blocks on the network (incl. TLS + retries) so the render loop on
+// core 1 keeps animating. Sleeps until poked, fetches one sprite, publishes it.
+static void fetchTaskFn(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   // wait for a prefetch request
+        if (!pendReady) {
+            uint8_t* buf = nullptr; size_t len = 0; int id = -1; char nm[24];
+            SpriteType type = SPRITE_PNG;
+            if (pokemonPrefetch(nm, sizeof(nm), &id, &buf, &len, &type)) {
+                pendBuf = buf; pendLen = len; pendId = id; pendType = type;
+                strncpy(pendName, nm, sizeof(pendName) - 1);
+                pendName[sizeof(pendName) - 1] = 0;
+                pendReady = true;                  // publish last: gates the reader
+            }
+        }
+        fetchBusy = false;
     }
 }
 
-// Swap to the prefetched slide (cheap decode+draw), then immediately start
-// fetching the following one so it's ready before this slide's duration elapses.
+// Ask the background task to fetch the next sprite (no-op if one is ready or in
+// flight). Returns immediately — never blocks the render loop.
+static void requestPrefetch() {
+    if (pendReady || fetchBusy || !fetchTask) return;
+    fetchBusy = true;
+    xTaskNotifyGive(fetchTask);
+}
+
+// Swap to the prefetched slide if one is ready. If not, show the loading animation
+// and keep the request in flight; the loop retries once pendReady flips. Either
+// way, kick off the following fetch.
 static void advanceSlide() {
-    if (!pendReady) prefetchNext();          // slow net / button-mash: fetch now
-    bool ok = pendReady && displayDrawSprite(pendBuf, pendLen, pendName, pendId);
-    if (pendBuf) { netFree(pendBuf); pendBuf = nullptr; }
-    pendReady = false;
+    // Stop the current animation and free its GIF before we reuse the slot. Order
+    // matters: close the decoder (it references curGifBuf) before freeing the buffer.
+    displayAnimStop();
+    if (curGifBuf) { netFree(curGifBuf); curGifBuf = nullptr; }
+
+    bool ok = false;
+    if (pendReady) {
+        if (pendType == SPRITE_GIF) {
+            ok = displayAnimStart(pendBuf, pendLen, pendName, pendId);
+            if (ok) curGifBuf = pendBuf;         // keep alive — decoded frame by frame
+            else    netFree(pendBuf);
+        } else {
+            ok = displayShowStatic(pendBuf, pendLen, pendName, pendId);
+            netFree(pendBuf);                    // decoded into the canvas; raw not needed
+        }
+        pendBuf = nullptr;
+        pendReady = false;                       // consumed — free the slot for the next
+    }
 
     if (ok) {
         curId = pendId;
@@ -62,11 +91,12 @@ static void advanceSlide() {
         nameScrolls = displayNameScrolls(curName);
         displayDrawName(curName);
     } else {
-        displayStatus("no net");             // fetch/decode failed — retry via loop
+        displayLoadingStart();                   // nothing ready — animate while we fetch
         curId = -1;
     }
     slideStartMs = millis();
-    prefetchNext();                          // fetch the next one during this slide
+    // NB: the next prefetch is deliberately NOT kicked here — loop() starts it a
+    // bit into the slide so the network doesn't stutter the opening frames.
 }
 
 void setup() {
@@ -74,73 +104,85 @@ void setup() {
     delay(300);
     Serial.println("\n[boot] Pokedex Display");
 
-    prefs.begin("pokedex", false);
-    durationSec = clampDuration(prefs.getInt("dur", DEFAULT_DURATION_SEC));
-    Serial.printf("[boot] duration=%ds\n", durationSec);
+    settingsLoad();
+    Serial.printf("[boot] duration=%ds order=%s anim=%u brightness=%u\n",
+                  g_settings.durationSec, g_settings.randomOrder ? "random" : "seq",
+                  g_settings.animMode, g_settings.brightness);
 
     displayInit();
-    inputInit();
+    displaySetBrightness(g_settings.brightness);   // apply the saved brightness
+    displaySetSpeed(g_settings.speedPct);          // apply the saved playback speed
+    inputInit();                                   // rotary encoder + BOOT button
 
-    // Setup window: press BOOT now to (re)configure Wi-Fi via the captive portal.
-    // We poll here rather than at reset because BOOT is a strapping pin — holding
-    // it during reset would enter the ROM download bootloader instead of our app.
-    displayStatus("press BOOT\nfor wifi\nsetup");
-    bool forcePortal = false;
-    uint32_t t = millis();
-    while (millis() - t < SETUP_WINDOW_MS) {
-        if (digitalRead(PIN_ENC_SW) == LOW) { forcePortal = true; break; }
-        delay(20);
+    // No physical setup button on the finished unit: connect straight away. netStart()
+    // loops until connected — patiently retrying the saved network (riding out a
+    // router still booting after a power cut), and offering the setup portal only if
+    // that keeps failing. It shows the connecting / setup screens itself.
+    netStart();
+    Serial.println("[net] connected");
+
+    webInit();   // settings server at http://<HOSTNAME>.local/
+
+    // Background fetcher on core 0. Big stack: TLS handshakes are stack-hungry.
+    xTaskCreatePinnedToCore(fetchTaskFn, "fetch", 12288, nullptr, 1, &fetchTask, 0);
+
+    // Kick the first fetch and show the loading animation; loop() flips to the first
+    // slide as soon as it lands (curId < 0 branch), then keeps the pipeline full.
+    displayLoadingStart();
+    curId = -1;
+    slideStartMs = millis();
+    requestPrefetch();
+}
+
+// Adjust brightness from the encoder and persist it once the knob goes idle, so we
+// don't hammer NVS while it's being turned.
+static bool     briDirty = false;
+static uint32_t briChangedMs = 0;
+
+static void handleBrightnessKnob() {
+    int delta = inputReadDelta();
+    if (delta != 0) {
+        int b = (int)g_settings.brightness + delta * BRIGHTNESS_STEP;
+        if (b < BRIGHTNESS_MIN) b = BRIGHTNESS_MIN;
+        if (b > BRIGHTNESS_MAX) b = BRIGHTNESS_MAX;
+        g_settings.brightness = (uint8_t)b;
+        displaySetBrightness(g_settings.brightness);   // live
+        briDirty = true;
+        briChangedMs = millis();
     }
-
-    displayStatus("Wi-Fi...");
-    if (netStart(forcePortal)) {
-        Serial.println("[net] connected");
-        displayLoadingStart();          // State 1: animate while the first fetch runs
-    } else {
-        // Portal is kept open until configured, so this only trips on a hard
-        // failure — reboot and retry, as WiFiManager recommends.
-        Serial.println("[net] FAILED — restarting");
-        displayStatus("wifi fail\nrestart");
-        delay(1500);
-        ESP.restart();
+    if (briDirty && millis() - briChangedMs > BRIGHTNESS_SAVE_IDLE_MS) {
+        settingsSave();
+        briDirty = false;
+        Serial.printf("[main] brightness=%u saved\n", g_settings.brightness);
     }
-
-    advanceSlide();   // fetch (loading anim covers it) + show first, prefetch second
 }
 
 void loop() {
-    int  delta = inputReadDelta();
-    bool btn   = inputButtonPressed();
+    webTick();                 // serve any pending settings requests (non-blocking)
+    handleBrightnessKnob();    // rotary encoder -> live brightness (+ debounced save)
 
-    // Any knob movement enters adjust mode and nudges the duration.
-    if (delta != 0) {
-        durationSec = clampDuration(durationSec + delta);
-        mode = ADJUSTING;
-        lastAdjustMs = millis();
-        displayDrawDuration(durationSec);
-    }
+    if (inputButtonPressed())  // BOOT / encoder switch: skip to the next Pokémon
+        advanceSlide();
 
-    if (mode == ADJUSTING) {
-        if (millis() - lastAdjustMs > ADJUST_IDLE_MS) {
-            prefs.putInt("dur", durationSec);
-            Serial.printf("[main] duration=%ds saved\n", durationSec);
-            mode = SLIDESHOW;
-            if (curId > 0) displayDrawName(curName);   // restore name strip
-            slideStartMs = millis();                   // restart timing
+    if (curId < 0) {                              // waiting on a fetch (boot or dropout)
+        requestPrefetch();                        // keep a request in flight (retries)
+        if (pendReady) advanceSlide();            // landed — show it
+    } else {
+        uint32_t elapsed = millis() - slideStartMs;
+        bool overdue = elapsed >= (uint32_t)g_settings.durationSec * 1000UL;
+
+        // Start the next fetch once we're past the opening moment (or when overdue),
+        // capped at half the slide so short durations still prefetch in time.
+        uint32_t lead = (uint32_t)g_settings.durationSec * 1000UL / 2;
+        if (lead > PREFETCH_LEAD_MS) lead = PREFETCH_LEAD_MS;
+        if (overdue || elapsed >= lead) requestPrefetch();
+
+        if (overdue && pendReady) {
+            advanceSlide();                       // next is ready — swap on schedule
+        } else {
+            displayAnimTick();                    // keep animating this slide
+            if (nameScrolls) displayDrawName(curName);   // and the long-name marquee
         }
-        delay(5);
-        return;
-    }
-
-    // SLIDESHOW
-    if (btn) {
-        advanceSlide();
-    } else if (curId < 0) {
-        if (millis() - slideStartMs >= 5000) advanceSlide();   // retry after a dropout
-    } else if (millis() - slideStartMs >= (uint32_t)durationSec * 1000UL) {
-        advanceSlide();
-    } else if (nameScrolls) {
-        displayDrawName(curName);   // animate marquee for long names
     }
 
     delay(10);
