@@ -2,11 +2,10 @@
 #include <Arduino.h>
 
 // Bring up Wi-Fi. Credentials are provisioned via the on-device captive portal
-// (WiFiManager) and stored in NVS by the ESP core — no secrets.h needed.
-//   forcePortal = true  -> always open the "Pokedex-Setup" AP (BOOT-held setup)
-//   forcePortal = false -> try saved creds, only open the portal if none/failed
+// (WiFiManager) and stored in NVS by the ESP core — no secrets.h needed. Tries
+// saved creds; opens the "Pokedex-Setup" AP only if there are none / can't join.
 // Returns true once connected as a station.
-bool netStart(bool forcePortal);
+bool netStart();
 
 // Reconnect using saved creds if the link dropped (never opens the portal).
 bool netEnsure();
